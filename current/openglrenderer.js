@@ -10457,7 +10457,7 @@ var _asyncify_start_unwind = (a0) => (_asyncify_start_unwind = wasmExports['asyn
 var _asyncify_stop_unwind = () => (_asyncify_stop_unwind = wasmExports['asyncify_stop_unwind'])();
 var _asyncify_start_rewind = (a0) => (_asyncify_start_rewind = wasmExports['asyncify_start_rewind'])(a0);
 var _asyncify_stop_rewind = () => (_asyncify_stop_rewind = wasmExports['asyncify_stop_rewind'])();
-var ___emscripten_embedded_file_data = Module['___emscripten_embedded_file_data'] = 106880;
+var ___emscripten_embedded_file_data = Module['___emscripten_embedded_file_data'] = 112888;
 
 // include: postamble.js
 // === Auto-generated postamble setup entry stuff ===
