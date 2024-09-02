@@ -643,6 +643,7 @@ var tempI64;
 function canvas_get_width() { return window.innerWidth; }
 function canvas_get_height() { return window.innerHeight; }
 function CloseWindow() { close(); }
+function ImGui_ImplGlfw_EmscriptenOpenURL(url) { url = url ? UTF8ToString(url) : null; if (url) window.open(url, '_blank'); }
 
 // end include: preamble.js
 
@@ -3530,6 +3531,46 @@ function CloseWindow() { close(); }
   var __emscripten_get_now_is_monotonic = () => nowIsMonotonic;
 
   var __emscripten_memcpy_js = (dest, src, num) => HEAPU8.copyWithin(dest, src, src + num);
+
+  var __emscripten_system = (command) => {
+      if (ENVIRONMENT_IS_NODE) {
+        if (!command) return 1; // shell is available
+  
+        var cmdstr = UTF8ToString(command);
+        if (!cmdstr.length) return 0; // this is what glibc seems to do (shell works test?)
+  
+        var cp = require('child_process');
+        var ret = cp.spawnSync(cmdstr, [], {shell:true, stdio:'inherit'});
+  
+        var _W_EXITCODE = (ret, sig) => ((ret) << 8 | (sig));
+  
+        // this really only can happen if process is killed by signal
+        if (ret.status === null) {
+          // sadly node doesn't expose such function
+          var signalToNumber = (sig) => {
+            // implement only the most common ones, and fallback to SIGINT
+            switch (sig) {
+              case 'SIGHUP': return 1;
+              case 'SIGINT': return 2;
+              case 'SIGQUIT': return 3;
+              case 'SIGFPE': return 8;
+              case 'SIGKILL': return 9;
+              case 'SIGALRM': return 14;
+              case 'SIGTERM': return 15;
+            }
+            return 2; // SIGINT
+          }
+          return _W_EXITCODE(0, signalToNumber(ret.signal));
+        }
+  
+        return _W_EXITCODE(ret.status, 0);
+      }
+      // int system(const char *command);
+      // http://pubs.opengroup.org/onlinepubs/000095399/functions/system.html
+      // Can't call external programs.
+      if (!command) return 0; // no shell available
+      return -52;
+    };
 
   var stringToUTF8 = (str, outPtr, maxBytesToWrite) => {
       return stringToUTF8Array(str, HEAPU8, outPtr, maxBytesToWrite);
@@ -8044,6 +8085,207 @@ function CloseWindow() { close(); }
       setMainLoop(browserIterationFunc, fps, simulateInfiniteLoop);
     };
 
+  var JSEvents = {
+  removeAllEventListeners() {
+        while (JSEvents.eventHandlers.length) {
+          JSEvents._removeHandler(JSEvents.eventHandlers.length - 1);
+        }
+        JSEvents.deferredCalls = [];
+      },
+  inEventHandler:0,
+  deferredCalls:[],
+  deferCall(targetFunction, precedence, argsList) {
+        function arraysHaveEqualContent(arrA, arrB) {
+          if (arrA.length != arrB.length) return false;
+  
+          for (var i in arrA) {
+            if (arrA[i] != arrB[i]) return false;
+          }
+          return true;
+        }
+        // Test if the given call was already queued, and if so, don't add it again.
+        for (var call of JSEvents.deferredCalls) {
+          if (call.targetFunction == targetFunction && arraysHaveEqualContent(call.argsList, argsList)) {
+            return;
+          }
+        }
+        JSEvents.deferredCalls.push({
+          targetFunction,
+          precedence,
+          argsList
+        });
+  
+        JSEvents.deferredCalls.sort((x,y) => x.precedence < y.precedence);
+      },
+  removeDeferredCalls(targetFunction) {
+        JSEvents.deferredCalls = JSEvents.deferredCalls.filter((call) => call.targetFunction != targetFunction);
+      },
+  canPerformEventHandlerRequests() {
+        if (navigator.userActivation) {
+          // Verify against transient activation status from UserActivation API
+          // whether it is possible to perform a request here without needing to defer. See
+          // https://developer.mozilla.org/en-US/docs/Web/Security/User_activation#transient_activation
+          // and https://caniuse.com/mdn-api_useractivation
+          // At the time of writing, Firefox does not support this API: https://bugzilla.mozilla.org/show_bug.cgi?id=1791079
+          return navigator.userActivation.isActive;
+        }
+  
+        return JSEvents.inEventHandler && JSEvents.currentEventHandler.allowsDeferredCalls;
+      },
+  runDeferredCalls() {
+        if (!JSEvents.canPerformEventHandlerRequests()) {
+          return;
+        }
+        var deferredCalls = JSEvents.deferredCalls;
+        JSEvents.deferredCalls = [];
+        for (var call of deferredCalls) {
+          call.targetFunction(...call.argsList);
+        }
+      },
+  eventHandlers:[],
+  removeAllHandlersOnTarget:(target, eventTypeString) => {
+        for (var i = 0; i < JSEvents.eventHandlers.length; ++i) {
+          if (JSEvents.eventHandlers[i].target == target &&
+            (!eventTypeString || eventTypeString == JSEvents.eventHandlers[i].eventTypeString)) {
+             JSEvents._removeHandler(i--);
+           }
+        }
+      },
+  _removeHandler(i) {
+        var h = JSEvents.eventHandlers[i];
+        h.target.removeEventListener(h.eventTypeString, h.eventListenerFunc, h.useCapture);
+        JSEvents.eventHandlers.splice(i, 1);
+      },
+  registerOrRemoveHandler(eventHandler) {
+        if (!eventHandler.target) {
+          return -4;
+        }
+        if (eventHandler.callbackfunc) {
+          eventHandler.eventListenerFunc = function(event) {
+            // Increment nesting count for the event handler.
+            ++JSEvents.inEventHandler;
+            JSEvents.currentEventHandler = eventHandler;
+            // Process any old deferred calls the user has placed.
+            JSEvents.runDeferredCalls();
+            // Process the actual event, calls back to user C code handler.
+            eventHandler.handlerFunc(event);
+            // Process any new deferred calls that were placed right now from this event handler.
+            JSEvents.runDeferredCalls();
+            // Out of event handler - restore nesting count.
+            --JSEvents.inEventHandler;
+          };
+  
+          eventHandler.target.addEventListener(eventHandler.eventTypeString,
+                                               eventHandler.eventListenerFunc,
+                                               eventHandler.useCapture);
+          JSEvents.eventHandlers.push(eventHandler);
+        } else {
+          for (var i = 0; i < JSEvents.eventHandlers.length; ++i) {
+            if (JSEvents.eventHandlers[i].target == eventHandler.target
+             && JSEvents.eventHandlers[i].eventTypeString == eventHandler.eventTypeString) {
+               JSEvents._removeHandler(i--);
+             }
+          }
+        }
+        return 0;
+      },
+  getNodeNameForTarget(target) {
+        if (!target) return '';
+        if (target == window) return '#window';
+        if (target == screen) return '#screen';
+        return target?.nodeName || '';
+      },
+  fullscreenEnabled() {
+        return document.fullscreenEnabled
+        // Safari 13.0.3 on macOS Catalina 10.15.1 still ships with prefixed webkitFullscreenEnabled.
+        // TODO: If Safari at some point ships with unprefixed version, update the version check above.
+        || document.webkitFullscreenEnabled
+         ;
+      },
+  };
+  
+  
+  
+  /** @type {Object} */
+  var specialHTMLTargets = [0, typeof document != 'undefined' ? document : 0, typeof window != 'undefined' ? window : 0];
+  var getBoundingClientRect = (e) => specialHTMLTargets.indexOf(e) < 0 ? e.getBoundingClientRect() : {'left':0,'top':0};
+  
+  var fillMouseEventData = (eventStruct, e, target) => {
+      HEAPF64[((eventStruct)>>3)] = e.timeStamp;
+      var idx = ((eventStruct)>>2);
+      HEAP32[idx + 2] = e.screenX;
+      HEAP32[idx + 3] = e.screenY;
+      HEAP32[idx + 4] = e.clientX;
+      HEAP32[idx + 5] = e.clientY;
+      HEAP8[eventStruct + 24] = e.ctrlKey;
+      HEAP8[eventStruct + 25] = e.shiftKey;
+      HEAP8[eventStruct + 26] = e.altKey;
+      HEAP8[eventStruct + 27] = e.metaKey;
+      HEAP16[idx*2 + 14] = e.button;
+      HEAP16[idx*2 + 15] = e.buttons;
+  
+      HEAP32[idx + 8] = e["movementX"]
+        ;
+  
+      HEAP32[idx + 9] = e["movementY"]
+        ;
+  
+      // Note: rect contains doubles (truncated to placate SAFE_HEAP, which is the same behaviour when writing to HEAP32 anyway)
+      var rect = getBoundingClientRect(target);
+      HEAP32[idx + 10] = e.clientX - (rect.left | 0);
+      HEAP32[idx + 11] = e.clientY - (rect.top  | 0);
+  
+    };
+  
+  var maybeCStringToJsString = (cString) => {
+      // "cString > 2" checks if the input is a number, and isn't of the special
+      // values we accept here, EMSCRIPTEN_EVENT_TARGET_* (which map to 0, 1, 2).
+      // In other words, if cString > 2 then it's a pointer to a valid place in
+      // memory, and points to a C string.
+      return cString > 2 ? UTF8ToString(cString) : cString;
+    };
+  
+  var findEventTarget = (target) => {
+      target = maybeCStringToJsString(target);
+      var domElement = specialHTMLTargets[target] || (typeof document != 'undefined' ? document.querySelector(target) : undefined);
+      return domElement;
+    };
+  
+  var registerWheelEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
+      if (!JSEvents.wheelEvent) JSEvents.wheelEvent = _malloc(96);
+  
+      // The DOM Level 3 events spec event 'wheel'
+      var wheelHandlerFunc = (e = event) => {
+        var wheelEvent = JSEvents.wheelEvent;
+        fillMouseEventData(wheelEvent, e, target);
+        HEAPF64[(((wheelEvent)+(64))>>3)] = e["deltaX"];
+        HEAPF64[(((wheelEvent)+(72))>>3)] = e["deltaY"];
+        HEAPF64[(((wheelEvent)+(80))>>3)] = e["deltaZ"];
+        HEAP32[(((wheelEvent)+(88))>>2)] = e["deltaMode"];
+        if (((a1, a2, a3) => dynCall_iiii(callbackfunc, a1, a2, a3))(eventTypeId, wheelEvent, userData)) e.preventDefault();
+      };
+  
+      var eventHandler = {
+        target,
+        allowsDeferredCalls: true,
+        eventTypeString,
+        callbackfunc,
+        handlerFunc: wheelHandlerFunc,
+        useCapture
+      };
+      return JSEvents.registerOrRemoveHandler(eventHandler);
+    };
+  
+  var _emscripten_set_wheel_callback_on_thread = (target, userData, useCapture, callbackfunc, targetThread) => {
+      target = findEventTarget(target);
+      if (!target) return -4;
+      if (typeof target.onwheel != 'undefined') {
+        return registerWheelEventCallback(target, userData, useCapture, callbackfunc, 9, "wheel", targetThread);
+      } else {
+        return -1;
+      }
+    };
+
   var ENV = {
   };
   
@@ -8107,6 +8349,7 @@ function CloseWindow() { close(); }
       HEAPU32[((penviron_buf_size)>>2)] = bufSize;
       return 0;
     };
+
 
   function _fd_close(fd) {
   try {
@@ -8203,6 +8446,37 @@ function CloseWindow() { close(); }
     return e.errno;
   }
   }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -9333,7 +9607,85 @@ function CloseWindow() { close(); }
         return table[param];
       },
   };
+  var _glfwCreateStandardCursor = (shape) => {};
+
   var _glfwCreateWindow = (width, height, title, monitor, share) => GLFW.createWindow(width, height, title, monitor, share);
+
+  var _glfwDestroyCursor = (cursor) => {};
+
+  var _glfwGetClipboardString = (win) => {};
+
+  var _glfwGetCursorPos = (winid, x, y) => GLFW.getCursorPos(winid, x, y);
+
+  var _glfwGetFramebufferSize = (winid, width, height) => {
+      var ww = 0;
+      var wh = 0;
+  
+      var win = GLFW.WindowFromId(winid);
+      if (win) {
+        ww = win.framebufferWidth;
+        wh = win.framebufferHeight;
+      }
+  
+      if (width) {
+        HEAP32[((width)>>2)] = ww;
+      }
+  
+      if (height) {
+        HEAP32[((height)>>2)] = wh;
+      }
+    };
+
+  var _glfwGetInputMode = (winid, mode) => {
+      var win = GLFW.WindowFromId(winid);
+      if (!win) return;
+  
+      switch (mode) {
+        case 0x00033001: { // GLFW_CURSOR
+          if (Browser.pointerLock) {
+            win.inputModes[mode] = 0x00034003; // GLFW_CURSOR_DISABLED
+          } else {
+            win.inputModes[mode] = 0x00034001; // GLFW_CURSOR_NORMAL
+          }
+        }
+      }
+  
+      return win.inputModes[mode];
+    };
+
+  var _glfwGetJoystickAxes = (joy, count) => {
+      GLFW.refreshJoysticks();
+  
+      var state = GLFW.joys[joy];
+      if (!state || !state.axes) {
+        HEAP32[((count)>>2)] = 0;
+        return;
+      }
+  
+      HEAP32[((count)>>2)] = state.axesCount;
+      return state.axes;
+    };
+
+  var _glfwGetJoystickButtons = (joy, count) => {
+      GLFW.refreshJoysticks();
+  
+      var state = GLFW.joys[joy];
+      if (!state || !state.buttons) {
+        HEAP32[((count)>>2)] = 0;
+        return;
+      }
+  
+      HEAP32[((count)>>2)] = state.buttonsCount;
+      return state.buttons;
+    };
+
+  var _glfwGetKey = (winid, key) => GLFW.getKey(winid, key);
+
+  var _glfwGetMouseButton = (winid, button) => GLFW.getMouseButton(winid, button);
+
+  var _glfwGetTime = () => GLFW.getTime() - GLFW.initialTime;
+
+  var _glfwGetWindowSize = (winid, width, height) => GLFW.getWindowSize(winid, width, height);
 
   
   
@@ -9392,13 +9744,53 @@ function CloseWindow() { close(); }
 
   var _glfwPollEvents = () => {};
 
+  var _glfwSetCharCallback = (winid, cbfun) => GLFW.setCharCallback(winid, cbfun);
+
+  var _glfwSetClipboardString = (win, string) => {};
+
+  var _glfwSetCursor = (winid, cursor) => {};
+
+  var _glfwSetCursorEnterCallback = (winid, cbfun) => {
+      var win = GLFW.WindowFromId(winid);
+      if (!win) return null;
+      var prevcbfun = win.cursorEnterFunc;
+      win.cursorEnterFunc = cbfun;
+      return prevcbfun;
+    };
+
+  var _glfwSetCursorPos = (winid, x, y) => GLFW.setCursorPos(winid, x, y);
+
+  var _glfwSetCursorPosCallback = (winid, cbfun) => GLFW.setCursorPosCallback(winid, cbfun);
+
   var _glfwSetErrorCallback = (cbfun) => {
       var prevcbfun = GLFW.errorFunc;
       GLFW.errorFunc = cbfun;
       return prevcbfun;
     };
 
+  var _glfwSetInputMode = (winid, mode, value) => {
+      GLFW.setInputMode(winid, mode, value);
+    };
+
+  var _glfwSetKeyCallback = (winid, cbfun) => GLFW.setKeyCallback(winid, cbfun);
+
+  var _glfwSetMonitorCallback = (cbfun) => {
+      var prevcbfun = GLFW.monitorFunc;
+      GLFW.monitorFunc = cbfun;
+      return prevcbfun;
+    };
+
+  var _glfwSetMouseButtonCallback = (winid, cbfun) => GLFW.setMouseButtonCallback(winid, cbfun);
+
   var _glfwSetScrollCallback = (winid, cbfun) => GLFW.setScrollCallback(winid, cbfun);
+
+  var _glfwSetWindowFocusCallback = (winid, cbfun) => {
+      var win = GLFW.WindowFromId(winid);
+      if (!win) return null;
+      var prevcbfun = win.windowFocusFunc;
+      win.windowFocusFunc = cbfun;
+      return prevcbfun;
+    };
 
   var _glfwSetWindowIconifyCallback = (winid, cbfun) => {
       var win = GLFW.WindowFromId(winid);
@@ -9749,6 +10141,8 @@ var miniTempWebGLIntBuffersStorage = new Int32Array(288);
       var preloadedAudios = {};;
 var wasmImports = {
   /** @export */
+  ImGui_ImplGlfw_EmscriptenOpenURL,
+  /** @export */
   __cxa_throw: ___cxa_throw,
   /** @export */
   __syscall_fcntl64: ___syscall_fcntl64,
@@ -9764,6 +10158,8 @@ var wasmImports = {
   _emscripten_get_now_is_monotonic: __emscripten_get_now_is_monotonic,
   /** @export */
   _emscripten_memcpy_js: __emscripten_memcpy_js,
+  /** @export */
+  _emscripten_system: __emscripten_system,
   /** @export */
   _tzset_js: __tzset_js,
   /** @export */
@@ -10329,9 +10725,13 @@ var wasmImports = {
   /** @export */
   emscripten_set_main_loop: _emscripten_set_main_loop,
   /** @export */
+  emscripten_set_wheel_callback_on_thread: _emscripten_set_wheel_callback_on_thread,
+  /** @export */
   environ_get: _environ_get,
   /** @export */
   environ_sizes_get: _environ_sizes_get,
+  /** @export */
+  exit: _exit,
   /** @export */
   fd_close: _fd_close,
   /** @export */
@@ -10341,9 +10741,27 @@ var wasmImports = {
   /** @export */
   fd_write: _fd_write,
   /** @export */
+  glActiveTexture: _glActiveTexture,
+  /** @export */
   glAttachShader: _glAttachShader,
   /** @export */
+  glBindBuffer: _glBindBuffer,
+  /** @export */
   glBindBufferRange: _glBindBufferRange,
+  /** @export */
+  glBindTexture: _glBindTexture,
+  /** @export */
+  glBindVertexArrayOES: _glBindVertexArrayOES,
+  /** @export */
+  glBlendEquation: _glBlendEquation,
+  /** @export */
+  glBlendEquationSeparate: _glBlendEquationSeparate,
+  /** @export */
+  glBlendFuncSeparate: _glBlendFuncSeparate,
+  /** @export */
+  glBufferData: _glBufferData,
+  /** @export */
+  glBufferSubData: _glBufferSubData,
   /** @export */
   glCompileShader: _glCompileShader,
   /** @export */
@@ -10351,15 +10769,39 @@ var wasmImports = {
   /** @export */
   glCreateShader: _glCreateShader,
   /** @export */
+  glDeleteBuffers: _glDeleteBuffers,
+  /** @export */
   glDeleteProgram: _glDeleteProgram,
   /** @export */
   glDeleteShader: _glDeleteShader,
+  /** @export */
+  glDeleteTextures: _glDeleteTextures,
+  /** @export */
+  glDeleteVertexArraysOES: _glDeleteVertexArraysOES,
+  /** @export */
+  glDetachShader: _glDetachShader,
+  /** @export */
+  glDisable: _glDisable,
   /** @export */
   glDrawArrays: _glDrawArrays,
   /** @export */
   glDrawElements: _glDrawElements,
   /** @export */
+  glEnable: _glEnable,
+  /** @export */
+  glEnableVertexAttribArray: _glEnableVertexAttribArray,
+  /** @export */
+  glGenBuffers: _glGenBuffers,
+  /** @export */
+  glGenTextures: _glGenTextures,
+  /** @export */
+  glGenVertexArraysOES: _glGenVertexArraysOES,
+  /** @export */
   glGetActiveUniformBlockiv: _glGetActiveUniformBlockiv,
+  /** @export */
+  glGetAttribLocation: _glGetAttribLocation,
+  /** @export */
+  glGetIntegerv: _glGetIntegerv,
   /** @export */
   glGetProgramInfoLog: _glGetProgramInfoLog,
   /** @export */
@@ -10373,15 +10815,59 @@ var wasmImports = {
   /** @export */
   glGetUniformBlockIndex: _glGetUniformBlockIndex,
   /** @export */
+  glGetUniformLocation: _glGetUniformLocation,
+  /** @export */
+  glIsEnabled: _glIsEnabled,
+  /** @export */
+  glIsProgram: _glIsProgram,
+  /** @export */
   glLinkProgram: _glLinkProgram,
+  /** @export */
+  glScissor: _glScissor,
   /** @export */
   glShaderSource: _glShaderSource,
   /** @export */
+  glTexImage2D: _glTexImage2D,
+  /** @export */
+  glTexParameteri: _glTexParameteri,
+  /** @export */
+  glUniform1i: _glUniform1i,
+  /** @export */
   glUniformBlockBinding: _glUniformBlockBinding,
+  /** @export */
+  glUniformMatrix4fv: _glUniformMatrix4fv,
   /** @export */
   glUseProgram: _glUseProgram,
   /** @export */
+  glVertexAttribPointer: _glVertexAttribPointer,
+  /** @export */
+  glViewport: _glViewport,
+  /** @export */
+  glfwCreateStandardCursor: _glfwCreateStandardCursor,
+  /** @export */
   glfwCreateWindow: _glfwCreateWindow,
+  /** @export */
+  glfwDestroyCursor: _glfwDestroyCursor,
+  /** @export */
+  glfwGetClipboardString: _glfwGetClipboardString,
+  /** @export */
+  glfwGetCursorPos: _glfwGetCursorPos,
+  /** @export */
+  glfwGetFramebufferSize: _glfwGetFramebufferSize,
+  /** @export */
+  glfwGetInputMode: _glfwGetInputMode,
+  /** @export */
+  glfwGetJoystickAxes: _glfwGetJoystickAxes,
+  /** @export */
+  glfwGetJoystickButtons: _glfwGetJoystickButtons,
+  /** @export */
+  glfwGetKey: _glfwGetKey,
+  /** @export */
+  glfwGetMouseButton: _glfwGetMouseButton,
+  /** @export */
+  glfwGetTime: _glfwGetTime,
+  /** @export */
+  glfwGetWindowSize: _glfwGetWindowSize,
   /** @export */
   glfwInit: _glfwInit,
   /** @export */
@@ -10389,9 +10875,31 @@ var wasmImports = {
   /** @export */
   glfwPollEvents: _glfwPollEvents,
   /** @export */
+  glfwSetCharCallback: _glfwSetCharCallback,
+  /** @export */
+  glfwSetClipboardString: _glfwSetClipboardString,
+  /** @export */
+  glfwSetCursor: _glfwSetCursor,
+  /** @export */
+  glfwSetCursorEnterCallback: _glfwSetCursorEnterCallback,
+  /** @export */
+  glfwSetCursorPos: _glfwSetCursorPos,
+  /** @export */
+  glfwSetCursorPosCallback: _glfwSetCursorPosCallback,
+  /** @export */
   glfwSetErrorCallback: _glfwSetErrorCallback,
   /** @export */
+  glfwSetInputMode: _glfwSetInputMode,
+  /** @export */
+  glfwSetKeyCallback: _glfwSetKeyCallback,
+  /** @export */
+  glfwSetMonitorCallback: _glfwSetMonitorCallback,
+  /** @export */
+  glfwSetMouseButtonCallback: _glfwSetMouseButtonCallback,
+  /** @export */
   glfwSetScrollCallback: _glfwSetScrollCallback,
+  /** @export */
+  glfwSetWindowFocusCallback: _glfwSetWindowFocusCallback,
   /** @export */
   glfwSetWindowIconifyCallback: _glfwSetWindowIconifyCallback,
   /** @export */
@@ -10423,9 +10931,11 @@ var dynCall_ii = Module['dynCall_ii'] = (a0, a1) => (dynCall_ii = Module['dynCal
 var dynCall_v = Module['dynCall_v'] = (a0) => (dynCall_v = Module['dynCall_v'] = wasmExports['dynCall_v'])(a0);
 var dynCall_vidd = Module['dynCall_vidd'] = (a0, a1, a2, a3) => (dynCall_vidd = Module['dynCall_vidd'] = wasmExports['dynCall_vidd'])(a0, a1, a2, a3);
 var dynCall_vi = Module['dynCall_vi'] = (a0, a1) => (dynCall_vi = Module['dynCall_vi'] = wasmExports['dynCall_vi'])(a0, a1);
-var dynCall_iiiiiii = Module['dynCall_iiiiiii'] = (a0, a1, a2, a3, a4, a5, a6) => (dynCall_iiiiiii = Module['dynCall_iiiiiii'] = wasmExports['dynCall_iiiiiii'])(a0, a1, a2, a3, a4, a5, a6);
+var dynCall_iii = Module['dynCall_iii'] = (a0, a1, a2) => (dynCall_iii = Module['dynCall_iii'] = wasmExports['dynCall_iii'])(a0, a1, a2);
 var dynCall_viiii = Module['dynCall_viiii'] = (a0, a1, a2, a3, a4) => (dynCall_viiii = Module['dynCall_viiii'] = wasmExports['dynCall_viiii'])(a0, a1, a2, a3, a4);
+var dynCall_fii = Module['dynCall_fii'] = (a0, a1, a2) => (dynCall_fii = Module['dynCall_fii'] = wasmExports['dynCall_fii'])(a0, a1, a2);
 var dynCall_viiiii = Module['dynCall_viiiii'] = (a0, a1, a2, a3, a4, a5) => (dynCall_viiiii = Module['dynCall_viiiii'] = wasmExports['dynCall_viiiii'])(a0, a1, a2, a3, a4, a5);
+var dynCall_iiiiiii = Module['dynCall_iiiiiii'] = (a0, a1, a2, a3, a4, a5, a6) => (dynCall_iiiiiii = Module['dynCall_iiiiiii'] = wasmExports['dynCall_iiiiiii'])(a0, a1, a2, a3, a4, a5, a6);
 var dynCall_vffff = Module['dynCall_vffff'] = (a0, a1, a2, a3, a4) => (dynCall_vffff = Module['dynCall_vffff'] = wasmExports['dynCall_vffff'])(a0, a1, a2, a3, a4);
 var dynCall_vf = Module['dynCall_vf'] = (a0, a1) => (dynCall_vf = Module['dynCall_vf'] = wasmExports['dynCall_vf'])(a0, a1);
 var dynCall_viiiiiiii = Module['dynCall_viiiiiiii'] = (a0, a1, a2, a3, a4, a5, a6, a7, a8) => (dynCall_viiiiiiii = Module['dynCall_viiiiiiii'] = wasmExports['dynCall_viiiiiiii'])(a0, a1, a2, a3, a4, a5, a6, a7, a8);
@@ -10433,7 +10943,6 @@ var dynCall_viiiiiiiii = Module['dynCall_viiiiiiiii'] = (a0, a1, a2, a3, a4, a5,
 var dynCall_i = Module['dynCall_i'] = (a0) => (dynCall_i = Module['dynCall_i'] = wasmExports['dynCall_i'])(a0);
 var dynCall_vff = Module['dynCall_vff'] = (a0, a1, a2) => (dynCall_vff = Module['dynCall_vff'] = wasmExports['dynCall_vff'])(a0, a1, a2);
 var dynCall_viiiiiii = Module['dynCall_viiiiiii'] = (a0, a1, a2, a3, a4, a5, a6, a7) => (dynCall_viiiiiii = Module['dynCall_viiiiiii'] = wasmExports['dynCall_viiiiiii'])(a0, a1, a2, a3, a4, a5, a6, a7);
-var dynCall_iii = Module['dynCall_iii'] = (a0, a1, a2) => (dynCall_iii = Module['dynCall_iii'] = wasmExports['dynCall_iii'])(a0, a1, a2);
 var dynCall_vfi = Module['dynCall_vfi'] = (a0, a1, a2) => (dynCall_vfi = Module['dynCall_vfi'] = wasmExports['dynCall_vfi'])(a0, a1, a2);
 var dynCall_viif = Module['dynCall_viif'] = (a0, a1, a2, a3) => (dynCall_viif = Module['dynCall_viif'] = wasmExports['dynCall_viif'])(a0, a1, a2, a3);
 var dynCall_vif = Module['dynCall_vif'] = (a0, a1, a2) => (dynCall_vif = Module['dynCall_vif'] = wasmExports['dynCall_vif'])(a0, a1, a2);
@@ -10457,7 +10966,7 @@ var _asyncify_start_unwind = (a0) => (_asyncify_start_unwind = wasmExports['asyn
 var _asyncify_stop_unwind = () => (_asyncify_stop_unwind = wasmExports['asyncify_stop_unwind'])();
 var _asyncify_start_rewind = (a0) => (_asyncify_start_rewind = wasmExports['asyncify_start_rewind'])(a0);
 var _asyncify_stop_rewind = () => (_asyncify_stop_rewind = wasmExports['asyncify_stop_rewind'])();
-var ___emscripten_embedded_file_data = Module['___emscripten_embedded_file_data'] = 1593468;
+var ___emscripten_embedded_file_data = Module['___emscripten_embedded_file_data'] = 1855512;
 
 // include: postamble.js
 // === Auto-generated postamble setup entry stuff ===
